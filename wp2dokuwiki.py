@@ -42,7 +42,10 @@ def get_categories():
         res = requests.get(url, auth=AUTH)
         res.raise_for_status()
         for cat in res.json():
-            categories[cat['id']] = cat['slug'] # または cat['name'] (今回はURLセーフなslugを採用)
+            # 【修正1】 'slug' ではなく 'name' (カテゴリの表示名) を取得
+            # 取得した名前に含まれるかもしれない余分な空白や記号をDokuWiki向けに掃除
+            clean_name = sanitize_filename(cat['name'])
+            categories[cat['id']] = clean_name
         url = res.links.get('next', {}).get('url')
     return categories
 
@@ -66,8 +69,11 @@ def get_posts():
 # 3. テキストとHTMLの変換・整形関数
 # ==========================================
 def sanitize_filename(title):
+    # 【修正2】パーセントエンコードされた日本語(%e6%9c...)をデコードして元の文字に戻す
+    decoded_title = unquote(title)
+    
     # 【】を_に変換し、DokuWikiで使えない記号を削除
-    clean = title.replace('【', '_').replace('】', '_')
+    clean = decoded_title.replace('【', '_').replace('】', '_')
     clean = re.sub(r'[\\/*?:"<>|#]+', '', clean)
     clean = re.sub(r'_+', '_', clean) # 連続するアンダースコアを1つに
     clean = clean.strip('_').strip()
@@ -172,8 +178,11 @@ def main():
     print(f"\n合計 {len(posts)} 件の投稿を処理します...")
     
     for post in posts:
-        title_raw = post['title']['rendered']
+        # WP側のスラッグ（post_name）がURLエンコードされている場合があるため、
+        # slugではなく純粋なタイトル(rendered)をベースにファイル名を生成するように統一
+        title_raw = unquote(post['title']['rendered'])
         title_clean = sanitize_filename(title_raw)
+        
         if not title_clean:
             title_clean = str(post['id'])
             

@@ -4,7 +4,7 @@ import configparser
 import requests
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ==========================================
 # 1. 設定の読み込みと準備
@@ -16,6 +16,10 @@ WP_URL = config['WordPress']['url']
 WP_USER = config['WordPress']['username']
 WP_PASS = config['WordPress']['app_password']
 DATA_DIR = config['DokuWiki']['data_dir']
+
+# タイムゾーンの取得（デフォルトは+9:日本時間）
+TZ_OFFSET = int(config.get('Settings', 'timezone_offset', fallback=9))
+TZ = timezone(timedelta(hours=TZ_OFFSET))
 
 API_BASE = f"{WP_URL}/wp-json/wp/v2"
 AUTH = (WP_USER, WP_PASS)
@@ -42,8 +46,7 @@ def get_categories():
         res = requests.get(url, auth=AUTH)
         res.raise_for_status()
         for cat in res.json():
-            # 【修正1】 'slug' ではなく 'name' (カテゴリの表示名) を取得
-            # 取得した名前に含まれるかもしれない余分な空白や記号をDokuWiki向けに掃除
+            # 'name' を取得し、DokuWiki準拠のサニタイズを通す
             clean_name = sanitize_filename(cat['name'])
             categories[cat['id']] = clean_name
         url = res.links.get('next', {}).get('url')
@@ -66,28 +69,36 @@ def get_posts():
     return posts
 
 # ==========================================
-# 3. テキストとHTMLの変換・整形関数
+# 3. テキスト・HTML・ファイル操作関数
 # ==========================================
 def sanitize_filename(title):
-    # 【修正2】パーセントエンコードされた日本語(%e6%9c...)をデコードして元の文字に戻す
-    decoded_title = unquote(title)
+    # 1. URLエンコードを解除
+    decoded = unquote(title)
     
-    # 【】を_に変換し、DokuWikiで使えない記号を削除
-    clean = decoded_title.replace('【', '_').replace('】', '_')
-    clean = re.sub(r'[\\/*?:"<>|#]+', '', clean)
-    clean = re.sub(r'_+', '_', clean) # 連続するアンダースコアを1つに
-    clean = clean.strip('_').strip()
-    return clean
+    # 2. 全て小文字化（DokuWikiの厳格な仕様）
+    decoded = decoded.lower()
+    
+    # 3. OSで絶対に使えない記号を削除
+    clean = re.sub(r'[\\/*?:"<>|#]+', '', decoded)
+    
+    # 4. ブラウザURLとして不適切な記号（括弧、句読点、空白など）をアンダーバーに置換
+    clean = re.sub(r'[ \s\(\)（）『』「」【】。、，,！!？?]', '_', clean)
+    
+    # 5. 連続するアンダーバーを1つにまとめる
+    clean = re.sub(r'_+', '_', clean)
+    
+    # 6. 先頭と末尾のアンダーバーを削除
+    return clean.strip('_')
 
 def get_original_image_url(url):
     # WPのリサイズ接尾辞 (例: -150x150.jpg) を削除してオリジナルURLを推測
     return re.sub(r'-\d+x\d+(\.[a-zA-Z]+)$', r'\1', url)
 
-def download_image(img_url, save_dir):
+def download_image(img_url, save_dir, unix_time):
     try:
         # URLをデコードしてファイル名を取得
         parsed_url = urlparse(img_url)
-        filename = unquote(os.path.basename(parsed_url.path))
+        filename = unquote(os.path.basename(parsed_url.path)).lower()
         save_path = os.path.join(save_dir, filename)
         
         if not os.path.exists(save_path):
@@ -96,19 +107,21 @@ def download_image(img_url, save_dir):
                 with open(save_path, 'wb') as f:
                     for chunk in res.iter_content(1024):
                         f.write(chunk)
+                
+                # 画像のOSタイムスタンプをWP側の公開日時に変更
+                os.utime(save_path, (unix_time, unix_time))
                 return filename
         return filename
     except Exception as e:
         print(f"画像ダウンロード失敗 ({img_url}): {e}")
         return None
 
-def convert_html_to_dokuwiki(html_content, media_dir, namespace_path):
+def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time):
     # Gutenbergのコメントブロックを削除
     html_content = re.sub(r'<!-- wp:.*?-->', '', html_content, flags=re.DOTALL)
     html_content = re.sub(r'<!-- /wp:.*?-->', '', html_content, flags=re.DOTALL)
     
     soup = BeautifulSoup(html_content, 'html.parser')
-    dokuwiki_text = ""
 
     # 画像の処理と置換
     for img in soup.find_all('img'):
@@ -116,14 +129,15 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path):
         if not img_url:
             continue
         original_url = get_original_image_url(img_url)
-        filename = download_image(original_url, media_dir)
+        # unix_timeを渡して、ダウンロード時にタイムスタンプを変更させる
+        filename = download_image(original_url, media_dir, unix_time)
         
         if filename:
             # DokuWikiの画像構文に置換 (パイプ含む、中央/右寄せなし)
             doku_img = f"{{{{:blog:{namespace_path}:{filename}|}}}}"
             img.replace_with(doku_img)
 
-    # シンプルなHTML要素をDokuWiki構文に変換（簡易版）
+    # シンプルなHTML要素をDokuWiki構文に変換
     for p in soup.find_all('p'):
         p.insert_before('\n\n')
         p.insert_after('\n\n')
@@ -131,7 +145,7 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path):
         
     for h in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
         level = int(h.name[1])
-        eq = '=' * (7 - level) # h1=======, h2======, h3====== ...
+        eq = '=' * (7 - level)
         h.insert_before(f'\n\n{eq} ')
         h.insert_after(f' {eq}\n\n')
         h.unwrap()
@@ -178,8 +192,17 @@ def main():
     print(f"\n合計 {len(posts)} 件の投稿を処理します...")
     
     for post in posts:
-        # WP側のスラッグ（post_name）がURLエンコードされている場合があるため、
-        # slugではなく純粋なタイトル(rendered)をベースにファイル名を生成するように統一
+        # WP側の日時を取得 (例: 2023-11-24T12:00:00)
+        date_raw = post['date']
+        
+        # タイムゾーンを考慮してUNIXタイムスタンプを計算
+        dt = datetime.fromisoformat(date_raw).replace(tzinfo=TZ)
+        unix_time = dt.timestamp()
+        
+        # DokuWiki METAプラグイン用の書式 (Tをスペースに置換)
+        date_str = date_raw.replace('T', ' ')
+        
+        # タイトルの取得とサニタイズ (ファイル名用)
         title_raw = unquote(post['title']['rendered'])
         title_clean = sanitize_filename(title_raw)
         
@@ -187,7 +210,6 @@ def main():
             title_clean = str(post['id'])
             
         status = post['status']
-        date_str = post['date'].replace('T', ' ') # 2023-01-01T12:00:00 -> 2023-01-01 12:00:00
         
         # ネームスペースの決定
         if status == 'draft':
@@ -195,31 +217,33 @@ def main():
         elif status == 'private':
             namespace = "private"
         else:
-            # 複数カテゴリがある場合は最初の1つを採用
             cat_ids = post.get('categories', [])
             if cat_ids and cat_ids[0] in cat_map:
                 namespace = cat_map[cat_ids[0]]
             else:
                 namespace = "uncategorized"
 
-        # DokuWiki上の保存先ディレクトリ
+        # DokuWiki上の保存先ディレクトリ作成
         post_page_dir = os.path.join(PAGES_BASE, namespace)
         post_media_dir = os.path.join(MEDIA_BASE, namespace)
         ensure_dir(post_page_dir)
         ensure_dir(post_media_dir)
 
-        # HTMLをDokuWiki構文に変換しつつ画像をダウンロード
+        # HTMLをDokuWiki構文に変換しつつ、画像をダウンロード＆タイムスタンプ変更
         html_content = post['content']['rendered']
-        dokuwiki_content = convert_html_to_dokuwiki(html_content, post_media_dir, namespace)
+        dokuwiki_content = convert_html_to_dokuwiki(html_content, post_media_dir, namespace, unix_time)
 
         # DokuWikiファイルの作成
         txt_path = os.path.join(post_page_dir, f"{title_clean}.txt")
         
-        # METAタグの付与
+        # ファイルの中身 (一番上の見出しは大文字小文字・記号など元のままのタイトルを利用)
         final_content = f"~~META: date created = {date_str} ~~\n\n====== {title_raw} ======\n\n{dokuwiki_content}"
 
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(final_content)
+            
+        # 生成したtxtファイルのOSタイムスタンプをWPの公開日時に変更
+        os.utime(txt_path, (unix_time, unix_time))
             
         print(f"出力完了: [blog:{namespace}:{title_clean}] ({status})")
 

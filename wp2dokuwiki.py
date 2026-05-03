@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import json
 import configparser
 import requests
 from urllib.parse import urlparse, unquote
@@ -13,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 config = configparser.ConfigParser()
 config.read('config.ini', encoding='utf-8')
 
-WP_URL = config['WordPress']['url']
+WP_URL = config['WordPress']['url'].rstrip('/')
 WP_USER = config['WordPress']['username']
 WP_PASS = config['WordPress']['app_password']
 DATA_DIR = config['DokuWiki']['data_dir']
@@ -21,6 +22,7 @@ DATA_DIR = config['DokuWiki']['data_dir']
 TZ_OFFSET = int(config.get('Settings', 'timezone_offset', fallback=9))
 TZ = timezone(timedelta(hours=TZ_OFFSET))
 INCLUDE_FQDN = config.getboolean('Settings', 'include_fqdn_in_redirects', fallback=False)
+USE_ORIGINAL = config.getboolean('Settings', 'use_original_image', fallback=True)
 
 API_BASE = f"{WP_URL}/wp-json/wp/v2"
 AUTH = (WP_USER, WP_PASS)
@@ -34,6 +36,9 @@ def ensure_dir(path):
 
 ensure_dir(PAGES_BASE)
 ensure_dir(MEDIA_BASE)
+
+# グローバルな画像マッピング用辞書 (加工済み名 -> オリジナル名)
+image_map_dict = {}
 
 # ==========================================
 # 2. WordPress APIからデータを取得する関数
@@ -72,44 +77,75 @@ def get_posts():
 def sanitize_filename(title):
     decoded = unquote(title)
     decoded = decoded.lower()
-    
-    # 完全にOSで使えない記号を消す
     clean = re.sub(r'[\\/*?:"<>|#]+', '', decoded)
-    
-    # アポストロフィや引用符も含めてアンダーバーに置換 (DokuWikiのURL仕様対策)
     clean = re.sub(r'[ \s\(\)（）『』「」【】。、，,！!？?\'\'""’‘“”]', '_', clean)
-    
-    # 連続するアンダーバーを1つにまとめる
     clean = re.sub(r'_+', '_', clean)
-    
     return clean.strip('_')
 
 def get_original_image_url(url):
-    return re.sub(r'-\d+x\d+(\.[a-zA-Z]+)$', r'\1', url)
+    # -scaled, -150x150, -e1602... などの接尾辞を削除してオリジナルURLを推測
+    return re.sub(r'(-\d+x\d+|-scaled|-e\d+)(\.[a-zA-Z]+)$', r'\2', url)
 
 def download_image(img_url, save_dir, unix_time):
+    """ 指定URLの画像をダウンロードし、ファイル名を返す。失敗時はNone """
     try:
         parsed_url = urlparse(img_url)
         filename = unquote(os.path.basename(parsed_url.path)).lower()
         save_path = os.path.join(save_dir, filename)
         
-        if not os.path.exists(save_path):
-            res = requests.get(img_url, stream=True)
-            if res.status_code == 200:
-                with open(save_path, 'wb') as f:
-                    for chunk in res.iter_content(1024):
-                        f.write(chunk)
-                os.utime(save_path, (unix_time, unix_time))
-                return filename
-        return filename
+        # 既に存在する場合はダウンロードをスキップ
+        if os.path.exists(save_path):
+            return filename
+
+        res = requests.get(img_url, stream=True)
+        if res.status_code == 200:
+            with open(save_path, 'wb') as f:
+                for chunk in res.iter_content(1024):
+                    f.write(chunk)
+            os.utime(save_path, (unix_time, unix_time))
+            return filename
+        else:
+            return None
     except Exception as e:
-        print(f"画像ダウンロード失敗 ({img_url}): {e}")
+        print(f"画像アクセスエラー ({img_url}): {e}")
         return None
 
-def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time):
-    # HTMLエンティティ(&#8217;等)をデコード
-    html_content = html.unescape(html_content)
+def process_and_download_image(target_url, media_dir, unix_time):
+    """
+    オリジナル画像と加工済み画像の両方の取得を試み、
+    Configに基づいてDokuWikiのテキストに記述すべきファイル名を返す。
+    """
+    original_url = get_original_image_url(target_url)
     
+    parsed_target = urlparse(target_url)
+    parsed_original = urlparse(original_url)
+    target_filename = unquote(os.path.basename(parsed_target.path)).lower()
+    original_filename = unquote(os.path.basename(parsed_original.path)).lower()
+
+    # オリジナル画像の取得を試みる
+    downloaded_original = None
+    if target_url != original_url:
+        downloaded_original = download_image(original_url, media_dir, unix_time)
+        
+        if downloaded_original:
+            # 両方ダウンロードする（容量OKとのことなので加工済みも保存しておく）
+            download_image(target_url, media_dir, unix_time)
+            # JSONマップに記録
+            image_map_dict[target_filename] = downloaded_original
+
+    # オリジナルがない(404等)、または元からオリジナルURLだった場合
+    if not downloaded_original:
+        downloaded_target = download_image(target_url, media_dir, unix_time)
+        return downloaded_target # 失敗時は加工済みのファイル名を返す (フェイルセーフ)
+
+    # オリジナルが存在した場合、Config設定に従って返すファイル名を決める
+    if USE_ORIGINAL:
+        return downloaded_original
+    else:
+        return target_filename
+
+def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time):
+    html_content = html.unescape(html_content)
     html_content = re.sub(r'<!-- wp:.*?-->', '', html_content, flags=re.DOTALL)
     html_content = re.sub(r'<!-- /wp:.*?-->', '', html_content, flags=re.DOTALL)
     
@@ -120,29 +156,31 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time)
         img_url = img.get('src')
         if not img_url: continue
 
-        target_url = get_original_image_url(img_url)
+        target_url = img_url
         
-        # 親が<a>タグの場合の特別な処理（誤ったimgのsrcを無視して<a>のhrefを採用する）
+        # <a>タグで囲まれていて、そのリンク先が画像の場合、<a>タグのhrefを優先（古いドメイン対策）
         parent = img.parent
         if parent and parent.name == 'a':
             href = parent.get('href', '')
             if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE):
                 target_url = href
-                parent.unwrap() # aタグを剥がす
+                parent.unwrap()
 
-        filename = download_image(target_url, media_dir, unix_time)
-        if filename:
-            img.replace_with(f"{{{{:blog:{namespace_path}:{filename}|}}}}")
+        # 画像のダウンロードと参照ファイル名の決定
+        write_filename = process_and_download_image(target_url, media_dir, unix_time)
+        
+        if write_filename:
+            img.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
 
     # 【処理2】リンクのみで配置された画像の処理と、通常のリンク処理
     for a in soup.find_all('a'):
         href = a.get('href', '')
         
-        # WP内の画像への直リンクか判定 (古いドメイン等も考慮し、拡張子で判断)
-        if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE):
-            filename = download_image(href, media_dir, unix_time)
-            if filename:
-                a.replace_with(f"{{{{:blog:{namespace_path}:{filename}|}}}}")
+        # WP内の画像への直リンクか判定
+        if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE) and 'wp-content/uploads' in href:
+            write_filename = process_and_download_image(href, media_dir, unix_time)
+            if write_filename:
+                a.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
                 continue
                 
         text = a.get_text(strip=True)
@@ -225,7 +263,6 @@ def main():
         unix_time = dt.timestamp()
         date_str = date_raw.replace('T', ' ')
         
-        # タイトルもHTMLエンティティをデコード
         title_raw = html.unescape(unquote(post['title']['rendered']))
         title_clean = sanitize_filename(title_raw)
         
@@ -266,14 +303,19 @@ def main():
         wp_link = post.get('link', '')
         if not INCLUDE_FQDN:
             wp_link = urlparse(wp_link).path
-        
         redirect_list.append(f"301 {wp_link} blog:{namespace}:{title_clean}")
 
-    # --- リダイレクト設定ファイルの出力 ---
+    # --- 1. リダイレクト設定ファイルの出力 ---
     redirects_path = os.path.join(DATA_DIR, 'redirects.txt')
     with open(redirects_path, 'w', encoding='utf-8') as f:
         f.write("\n".join(redirect_list) + "\n")
     print(f"\nリダイレクト設定ファイルを作成しました: {redirects_path}")
+
+    # --- 2. 画像マッピングJSONの出力 ---
+    image_map_path = os.path.join(DATA_DIR, 'image_map.json')
+    with open(image_map_path, 'w', encoding='utf-8') as f:
+        json.dump(image_map_dict, f, ensure_ascii=False, indent=4)
+    print(f"画像マッピングリストを作成しました: {image_map_path}")
 
 if __name__ == '__main__':
     main()

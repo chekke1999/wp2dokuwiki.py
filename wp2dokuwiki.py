@@ -305,14 +305,16 @@ def main():
             wp_link = urlparse(wp_link).path
         redirect_list.append(f"301 {wp_link} blog:{namespace}:{title_clean}")
 
-    # --- 1. リダイレクト設定ファイルの出力 ---
-    redirects_path = os.path.join(DATA_DIR, 'redirects.txt')
+# --- 1. リダイレクト設定ファイルの出力 ---
+    # 保存先をスクリプトと同じディレクトリに変更
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    redirects_path = os.path.join(script_dir, 'redirects.txt')
     with open(redirects_path, 'w', encoding='utf-8') as f:
         f.write("\n".join(redirect_list) + "\n")
     print(f"\nリダイレクト設定ファイルを作成しました: {redirects_path}")
 
     # --- 2. 画像マッピングJSONの出力 ---
-    image_map_path = os.path.join(DATA_DIR, 'image_map.json')
+    image_map_path = os.path.join(script_dir, 'image_map.json')
     with open(image_map_path, 'w', encoding='utf-8') as f:
         json.dump(image_map_dict, f, ensure_ascii=False, indent=4)
     print(f"画像マッピングリストを作成しました: {image_map_path}")

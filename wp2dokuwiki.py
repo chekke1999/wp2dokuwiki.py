@@ -46,7 +46,6 @@ def get_categories():
         res = requests.get(url, auth=AUTH)
         res.raise_for_status()
         for cat in res.json():
-            # カテゴリ名もHTMLエンティティをデコードしてからサニタイズ
             raw_name = html.unescape(cat['name'])
             categories[cat['id']] = sanitize_filename(raw_name)
         url = res.links.get('next', {}).get('url')
@@ -73,9 +72,16 @@ def get_posts():
 def sanitize_filename(title):
     decoded = unquote(title)
     decoded = decoded.lower()
+    
+    # 完全にOSで使えない記号を消す
     clean = re.sub(r'[\\/*?:"<>|#]+', '', decoded)
-    clean = re.sub(r'[ \s\(\)（）『』「」【】。、，,！!？?]', '_', clean)
+    
+    # アポストロフィや引用符も含めてアンダーバーに置換 (DokuWikiのURL仕様対策)
+    clean = re.sub(r'[ \s\(\)（）『』「」【】。、，,！!？?\'\'""’‘“”]', '_', clean)
+    
+    # 連続するアンダーバーを1つにまとめる
     clean = re.sub(r'_+', '_', clean)
+    
     return clean.strip('_')
 
 def get_original_image_url(url):
@@ -101,7 +107,7 @@ def download_image(img_url, save_dir, unix_time):
         return None
 
 def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time):
-    # HTMLエンティティ(&#8217;等)を本来の記号にデコード
+    # HTMLエンティティ(&#8217;等)をデコード
     html_content = html.unescape(html_content)
     
     html_content = re.sub(r'<!-- wp:.*?-->', '', html_content, flags=re.DOTALL)
@@ -113,16 +119,18 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time)
     for img in soup.find_all('img'):
         img_url = img.get('src')
         if not img_url: continue
+
+        target_url = get_original_image_url(img_url)
         
-        # <a>タグで囲まれていて、そのリンク先が画像の場合、<a>タグを剥がす
+        # 親が<a>タグの場合の特別な処理（誤ったimgのsrcを無視して<a>のhrefを採用する）
         parent = img.parent
         if parent and parent.name == 'a':
             href = parent.get('href', '')
             if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE):
-                parent.unwrap()
+                target_url = href
+                parent.unwrap() # aタグを剥がす
 
-        original_url = get_original_image_url(img_url)
-        filename = download_image(original_url, media_dir, unix_time)
+        filename = download_image(target_url, media_dir, unix_time)
         if filename:
             img.replace_with(f"{{{{:blog:{namespace_path}:{filename}|}}}}")
 
@@ -130,14 +138,13 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time)
     for a in soup.find_all('a'):
         href = a.get('href', '')
         
-        # WP内の画像への直リンクか判定
-        if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE) and 'wp-content/uploads' in href:
+        # WP内の画像への直リンクか判定 (古いドメイン等も考慮し、拡張子で判断)
+        if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE):
             filename = download_image(href, media_dir, unix_time)
             if filename:
                 a.replace_with(f"{{{{:blog:{namespace_path}:{filename}|}}}}")
                 continue
                 
-        # 通常のリンク
         text = a.get_text(strip=True)
         if text:
             a.replace_with(f"[[{href}|{text}]]")
@@ -167,7 +174,6 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time)
                     sep = '^'
                 else:
                     sep = '|'
-                # セル内の改行はDokuWikiの表を壊すのでスペースに置換
                 cell_text = cell.get_text().replace('\n', ' ').strip()
                 row_str += f"{sep} {cell_text} "
             

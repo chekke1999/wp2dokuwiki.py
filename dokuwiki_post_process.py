@@ -307,7 +307,10 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
     worker_str = str(max_workers) if max_workers else "Auto(全コア)"
     print(f"WebP変換を開始します [対象: {total_files}件, コア数制限: {worker_str}]...")
     
-    completed_results = []
+    converted_count = 0
+    total_original_size = 0
+    total_converted_size = 0
+    rename_dict = {}
     
     # マルチプロセスによる並列エンコード処理
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -319,89 +322,90 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
         completed_count = 0
         for future in concurrent.futures.as_completed(future_to_task):
             res = future.result()
-            completed_results.append(res)
             completed_count += 1
-            if not verbose:
+            
+            filename = res["filename"]
+            filepath = res["filepath"]
+            new_filepath = res["new_filepath"]
+            base_name, ext = os.path.splitext(filename)
+            ext_lower = ext.lower()
+
+            if not res["success"]:
+                if verbose:
+                    print(f"[エラー] 変換失敗 ({filename}): {res['error_msg']}")
+                else:
+                    # プログレスバー表示中に出力すると崩れるため、強制改行して表示
+                    print(f"\n[エラー] 変換失敗 ({filename}): {res['error_msg']}")
+                continue
+
+            # UUIDとオリジナルMD5の特定
+            orig_md5 = res["orig_md5"]
+            group_uuid = None
+            for uid, images in data["images"].items():
+                if orig_md5 in images:
+                    group_uuid = uid
+                    break
+
+            actual_ext = '.jpg' if res["real_format"] == 'JPEG' else '.png' if res["real_format"] == 'PNG' else ext_lower
+            
+            # 拡張子訂正
+            if keep_original and actual_ext != ext_lower and actual_ext in ['.jpg', '.png']:
+                corrected_filename = base_name + actual_ext
+                corrected_filepath = os.path.splitext(filepath)[0] + actual_ext
+                os.rename(filepath, corrected_filepath)
+                
+                if group_uuid and orig_md5:
+                    data["images"][group_uuid][orig_md5]["filename"] = corrected_filename
+                for page_id, groups in data.get("pages", {}).items():
+                    for uid, history_info in groups.items():
+                        if history_info.get("current") == filename:
+                            history_info["current"] = corrected_filename
+                        for k, v in history_info.get("history", {}).items():
+                            if v == filename:
+                                history_info["history"][k] = corrected_filename
+
+                rename_dict[filename] = corrected_filename
+                filename = corrected_filename
+                filepath = corrected_filepath
+
+            new_filename = os.path.basename(new_filepath)
+            rename_dict[filename] = new_filename
+            converted_count += 1
+            total_original_size += res["orig_size"]
+            total_converted_size += res["new_size"]
+
+            # 【変更点】 リアルタイムでのログ出力
+            if verbose:
+                print(f"[成功] {filename} ({format_size(res['orig_size'])}) -> {new_filename} ({format_size(res['new_size'])})")
+            else:
                 print_progress_bar(completed_count, total_files, prefix='Progress:', suffix='Complete', length=50)
 
-    # 並列処理が終わった後、結果をメインプロセスで集計・JSONへ登録
-    converted_count = 0
-    total_original_size = 0
-    total_converted_size = 0
-    rename_dict = {}
-
-    for res in completed_results:
-        filename = res["filename"]
-        filepath = res["filepath"]
-        new_filepath = res["new_filepath"]
-        base_name, ext = os.path.splitext(filename)
-        ext_lower = ext.lower()
-
-        if not res["success"]:
-            if verbose: print(f"[エラー] 変換失敗 ({filename}): {res['error_msg']}")
-            else: print(f"\n[エラー] 変換失敗 ({filename}): {res['error_msg']}")
-            continue
-
-        orig_md5 = res["orig_md5"]
-        group_uuid = None
-        for uid, images in data["images"].items():
-            if orig_md5 in images:
-                group_uuid = uid
-                break
-
-        actual_ext = '.jpg' if res["real_format"] == 'JPEG' else '.png' if res["real_format"] == 'PNG' else ext_lower
-        
-        if keep_original and actual_ext != ext_lower and actual_ext in ['.jpg', '.png']:
-            corrected_filename = base_name + actual_ext
-            corrected_filepath = os.path.splitext(filepath)[0] + actual_ext
-            os.rename(filepath, corrected_filepath)
+            # JSONへWebPの登録
+            if group_uuid and orig_md5 and res["new_md5"]:
+                conv_type = "lossless" if res["real_format"] == 'PNG' else "lossy"
+                data["images"][group_uuid][res["new_md5"]] = {
+                    "filename": new_filename,
+                    "filesize": res["new_size"],
+                    "is_original": False,
+                    "converted_from_md5": orig_md5,
+                    "conversion_type": conv_type
+                }
+                for page_id, groups in data.get("pages", {}).items():
+                    if group_uuid in groups:
+                        groups[group_uuid]["history"]["converted"] = new_filename
             
-            if group_uuid and orig_md5:
-                data["images"][group_uuid][orig_md5]["filename"] = corrected_filename
-            for page_id, groups in data.get("pages", {}).items():
-                for uid, history_info in groups.items():
-                    if history_info.get("current") == filename:
-                        history_info["current"] = corrected_filename
-                    for k, v in history_info.get("history", {}).items():
-                        if v == filename:
-                            history_info["history"][k] = corrected_filename
-
-            rename_dict[filename] = corrected_filename
-            filename = corrected_filename
-            filepath = corrected_filepath
-
-        new_filename = os.path.basename(new_filepath)
-        rename_dict[filename] = new_filename
-        converted_count += 1
-        total_original_size += res["orig_size"]
-        total_converted_size += res["new_size"]
-
-        if verbose:
-            print(f"[成功] {filename} ({format_size(res['orig_size'])}) -> {new_filename} ({format_size(res['new_size'])})")
-
-        if group_uuid and orig_md5 and res["new_md5"]:
-            conv_type = "lossless" if res["real_format"] == 'PNG' else "lossy"
-            data["images"][group_uuid][res["new_md5"]] = {
-                "filename": new_filename,
-                "filesize": res["new_size"],
-                "is_original": False,
-                "converted_from_md5": orig_md5,
-                "conversion_type": conv_type
-            }
-            for page_id, groups in data.get("pages", {}).items():
-                if group_uuid in groups:
-                    groups[group_uuid]["history"]["converted"] = new_filename
-        
-        if not keep_original:
-            os.remove(filepath)
-            if group_uuid and orig_md5:
-                del data["images"][group_uuid][orig_md5]
-                check_and_promote_original(data, group_uuid)
+            # 元画像の削除と昇格チェック
+            if not keep_original:
+                os.remove(filepath)
+                if group_uuid and orig_md5:
+                    del data["images"][group_uuid][orig_md5]
+                    check_and_promote_original(data, group_uuid)
 
     if converted_count == 0:
-        print("変換に成功した画像はありませんでした。")
+        print("\n変換に成功した画像はありませんでした。")
         return
 
+    # テキストファイルの書き換え
     txt_updated_count = 0
     def replace_ext_func(content):
         for old_name, new_name in rename_dict.items():
@@ -413,6 +417,7 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
         if update_text_file(filepath, replace_ext_func):
             txt_updated_count += 1
 
+    # DokuWiki上で参照が切り替わったため、pages の current も更新
     for page_id, groups in data.get("pages", {}).items():
         for group_uuid, history_info in groups.items():
             current = history_info.get("current")
@@ -421,6 +426,7 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
 
     save_image_map(data)
 
+    # サマリー
     saved_size = total_original_size - total_converted_size
     print("\n--- 変換サマリー ---")
     print(f"変換完了: {converted_count} / {total_files} 枚")

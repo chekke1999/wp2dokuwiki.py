@@ -7,6 +7,7 @@ import shutil
 import hashlib
 import argparse
 import configparser
+import concurrent.futures
 from PIL import Image, ImageFile
 
 # Pillowのファイル末尾破損等の許容度を上げる
@@ -26,8 +27,10 @@ IMAGE_MAP_PATH = os.path.join(script_dir, 'image_map.json')
 ARCHIVE_NS = config.get('Settings', 'archive_namespace', fallback='archive')
 ARCHIVE_DIR = os.path.join(MEDIA_BASE, ARCHIVE_NS)
 
+# ==========================================
+# ユーティリティ関数
+# ==========================================
 def format_size(size_in_bytes):
-    """ バイト数を人間が読みやすい単位に変換する """
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size_in_bytes < 1024.0:
             return f"{size_in_bytes:.2f} {unit}"
@@ -35,7 +38,6 @@ def format_size(size_in_bytes):
     return f"{size_in_bytes:.2f} PB"
 
 def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='█'):
-    """ コンソールにプログレスバーを表示する """
     percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
     filled_length = int(length * iteration // total)
     bar = fill * filled_length + '-' * (length - filled_length)
@@ -235,14 +237,53 @@ def cmd_archive():
     print(f"{archived_count} 件の画像を {ARCHIVE_NS} にアーカイブしました。")
 
 
-def cmd_convert_webp(target_format, referenced_only, keep_original, verbose):
+# --- 並列処理のワーカー関数 ---
+def encode_single_image(filepath, base_name, ext_lower):
+    """ マルチプロセスで呼ばれるエンコード関数 (I/O・CPUバウンド処理のみ担当) """
+    filename = os.path.basename(filepath)
+    new_filepath = os.path.splitext(filepath)[0] + '.webp'
+    
+    result = {
+        "success": False,
+        "filename": filename,
+        "filepath": filepath,
+        "new_filepath": new_filepath,
+        "orig_md5": get_file_md5(filepath),
+        "orig_size": os.path.getsize(filepath),
+        "new_md5": None,
+        "new_size": 0,
+        "real_format": None,
+        "error_msg": ""
+    }
+
+    try:
+        with Image.open(filepath) as img:
+            result["real_format"] = img.format
+            icc = img.info.get('icc_profile')
+            
+            if img.format == 'PNG':
+                img.save(new_filepath, format='WEBP', lossless=True, icc_profile=icc)
+            else:
+                img.save(new_filepath, format='WEBP', quality=85, icc_profile=icc)
+                
+        result["new_md5"] = get_file_md5(new_filepath)
+        result["new_size"] = os.path.getsize(new_filepath)
+        result["success"] = True
+    except Exception as e:
+        result["error_msg"] = str(e)
+
+    return result
+
+
+def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max_workers):
     media_files = get_all_media_files()
     data = load_image_map()
     txt_files = get_all_txt_files()
     referenced_images = get_referenced_images() if referenced_only else set()
     
-    # 変換対象リストの作成
-    target_files = []
+    target_tasks = []
+    
+    # 対象ファイルの絞り込み
     for filepath in media_files:
         filename = os.path.basename(filepath)
         base_name, ext = os.path.splitext(filename)
@@ -256,111 +297,109 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose):
         new_filepath = os.path.splitext(filepath)[0] + '.webp'
         if os.path.exists(new_filepath): continue
         
-        target_files.append(filepath)
+        target_tasks.append((filepath, base_name, ext_lower))
 
-    if not target_files:
+    if not target_tasks:
         print("変換対象の画像がありませんでした。")
         return
 
-    total_files = len(target_files)
-    converted_count = 0
-    rename_dict = {}
+    total_files = len(target_tasks)
+    worker_str = str(max_workers) if max_workers else "Auto(全コア)"
+    print(f"WebP変換を開始します [対象: {total_files}件, コア数制限: {worker_str}]...")
     
+    completed_results = []
+    
+    # マルチプロセスによる並列エンコード処理
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {
+            executor.submit(encode_single_image, path, bname, ext_l): (path, bname, ext_l) 
+            for path, bname, ext_l in target_tasks
+        }
+        
+        completed_count = 0
+        for future in concurrent.futures.as_completed(future_to_task):
+            res = future.result()
+            completed_results.append(res)
+            completed_count += 1
+            if not verbose:
+                print_progress_bar(completed_count, total_files, prefix='Progress:', suffix='Complete', length=50)
+
+    # 並列処理が終わった後、結果をメインプロセスで集計・JSONへ登録
+    converted_count = 0
     total_original_size = 0
     total_converted_size = 0
+    rename_dict = {}
 
-    print(f"WebP変換を開始します (対象: {total_files}件)...")
-    
-    for i, filepath in enumerate(target_files):
-        filename = os.path.basename(filepath)
+    for res in completed_results:
+        filename = res["filename"]
+        filepath = res["filepath"]
+        new_filepath = res["new_filepath"]
         base_name, ext = os.path.splitext(filename)
         ext_lower = ext.lower()
-        new_filename = base_name + '.webp'
-        new_filepath = os.path.splitext(filepath)[0] + '.webp'
 
-        try:
-            orig_md5 = get_file_md5(filepath)
-            group_uuid = None
-            for uid, images in data["images"].items():
-                if orig_md5 in images:
-                    group_uuid = uid
-                    break
+        if not res["success"]:
+            if verbose: print(f"[エラー] 変換失敗 ({filename}): {res['error_msg']}")
+            else: print(f"\n[エラー] 変換失敗 ({filename}): {res['error_msg']}")
+            continue
 
-            orig_size = os.path.getsize(filepath)
+        orig_md5 = res["orig_md5"]
+        group_uuid = None
+        for uid, images in data["images"].items():
+            if orig_md5 in images:
+                group_uuid = uid
+                break
 
-            with Image.open(filepath) as img:
-                real_format = img.format
-                actual_ext = '.jpg' if real_format == 'JPEG' else '.png' if real_format == 'PNG' else ext_lower
-                
-                # 拡張子訂正 (keep_originalの時のみ)
-                if keep_original and actual_ext != ext_lower and actual_ext in ['.jpg', '.png']:
-                    corrected_filename = base_name + actual_ext
-                    corrected_filepath = os.path.splitext(filepath)[0] + actual_ext
-                    os.rename(filepath, corrected_filepath)
-                    
-                    if group_uuid and orig_md5:
-                        data["images"][group_uuid][orig_md5]["filename"] = corrected_filename
-                    for page_id, groups in data.get("pages", {}).items():
-                        for uid, history_info in groups.items():
-                            if history_info.get("current") == filename:
-                                history_info["current"] = corrected_filename
-                            for k, v in history_info.get("history", {}).items():
-                                if v == filename:
-                                    history_info["history"][k] = corrected_filename
-
-                    rename_dict[filename] = corrected_filename
-                    filename = corrected_filename
-                    filepath = corrected_filepath
-
-                icc = img.info.get('icc_profile')
-                conv_type = "lossless" if real_format == 'PNG' else "lossy"
-                if real_format == 'PNG':
-                    img.save(new_filepath, format='WEBP', lossless=True, icc_profile=icc)
-                else:
-                    img.save(new_filepath, format='WEBP', quality=85, icc_profile=icc)
-                    
-            rename_dict[filename] = new_filename
-            new_md5 = get_file_md5(new_filepath)
-            conv_size = os.path.getsize(new_filepath)
+        actual_ext = '.jpg' if res["real_format"] == 'JPEG' else '.png' if res["real_format"] == 'PNG' else ext_lower
+        
+        if keep_original and actual_ext != ext_lower and actual_ext in ['.jpg', '.png']:
+            corrected_filename = base_name + actual_ext
+            corrected_filepath = os.path.splitext(filepath)[0] + actual_ext
+            os.rename(filepath, corrected_filepath)
             
-            converted_count += 1
-            total_original_size += orig_size
-            total_converted_size += conv_size
-            
-            # JSONへWebPの登録
-            if group_uuid and orig_md5 and new_md5:
-                data["images"][group_uuid][new_md5] = {
-                    "filename": new_filename,
-                    "filesize": conv_size,
-                    "is_original": False,
-                    "converted_from_md5": orig_md5,
-                    "conversion_type": conv_type
-                }
-                for page_id, groups in data.get("pages", {}).items():
-                    if group_uuid in groups:
-                        groups[group_uuid]["history"]["converted"] = new_filename
-            
-            if not keep_original:
-                os.remove(filepath)
-                if group_uuid and orig_md5:
-                    del data["images"][group_uuid][orig_md5]
-                    check_and_promote_original(data, group_uuid)
+            if group_uuid and orig_md5:
+                data["images"][group_uuid][orig_md5]["filename"] = corrected_filename
+            for page_id, groups in data.get("pages", {}).items():
+                for uid, history_info in groups.items():
+                    if history_info.get("current") == filename:
+                        history_info["current"] = corrected_filename
+                    for k, v in history_info.get("history", {}).items():
+                        if v == filename:
+                            history_info["history"][k] = corrected_filename
 
-            if verbose:
-                # --verbose が指定された場合、1件ずつログを出力
-                print(f"[成功] {filename} ({format_size(orig_size)}) -> {new_filename} ({format_size(conv_size)})")
-            else:
-                # 指定されていない場合はプログレスバーを更新
-                print_progress_bar(i + 1, total_files, prefix='Progress:', suffix='Complete', length=50)
+            rename_dict[filename] = corrected_filename
+            filename = corrected_filename
+            filepath = corrected_filepath
 
-        except Exception as e:
-            if verbose:
-                print(f"[エラー] 変換失敗 ({filename}): {e}")
-            else:
-                # プログレスバー表示中に出力すると崩れるため、強制改行して表示
-                print(f"\n[エラー] 変換失敗 ({filename}): {e}")
+        new_filename = os.path.basename(new_filepath)
+        rename_dict[filename] = new_filename
+        converted_count += 1
+        total_original_size += res["orig_size"]
+        total_converted_size += res["new_size"]
 
-    if not rename_dict:
+        if verbose:
+            print(f"[成功] {filename} ({format_size(res['orig_size'])}) -> {new_filename} ({format_size(res['new_size'])})")
+
+        if group_uuid and orig_md5 and res["new_md5"]:
+            conv_type = "lossless" if res["real_format"] == 'PNG' else "lossy"
+            data["images"][group_uuid][res["new_md5"]] = {
+                "filename": new_filename,
+                "filesize": res["new_size"],
+                "is_original": False,
+                "converted_from_md5": orig_md5,
+                "conversion_type": conv_type
+            }
+            for page_id, groups in data.get("pages", {}).items():
+                if group_uuid in groups:
+                    groups[group_uuid]["history"]["converted"] = new_filename
+        
+        if not keep_original:
+            os.remove(filepath)
+            if group_uuid and orig_md5:
+                del data["images"][group_uuid][orig_md5]
+                check_and_promote_original(data, group_uuid)
+
+    if converted_count == 0:
+        print("変換に成功した画像はありませんでした。")
         return
 
     txt_updated_count = 0
@@ -382,7 +421,6 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose):
 
     save_image_map(data)
 
-    # 最終サマリーの出力
     saved_size = total_original_size - total_converted_size
     print("\n--- 変換サマリー ---")
     print(f"変換完了: {converted_count} / {total_files} 枚")
@@ -392,7 +430,6 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose):
     if saved_size > 0:
         print(f"削減された容量:   {format_size(saved_size)}")
     print("--------------------")
-
 
 def cmd_resize_limit(limit_width, overwrite_mode):
     media_files = get_all_media_files()
@@ -453,7 +490,7 @@ if __name__ == '__main__':
     )
     
     # 参照管理グループ
-    grp_ref = parser.add_argument_group('参照切り替え・管理')
+    grp_ref = parser.add_argument_group('参照切り替え・管理オプション')
     grp_ref.add_argument('--switch', choices=['original', 'processed', 'converted'], 
                         help='テキスト内の画像参照を切り替える\n(original: オリジナル, processed: 加工済み, converted: WebP)')
     grp_ref.add_argument('--clean', action='store_true', 
@@ -462,9 +499,9 @@ if __name__ == '__main__':
                         help='未参照画像を削除せず、configで指定した退避先ネームスペースへ移動する')
     
     # WebP変換グループ
-    grp_webp = parser.add_argument_group('WebP一括変換')
+    grp_webp = parser.add_argument_group('WebP一括変換オプション')
     grp_webp.add_argument('--convert-webp', action='store_true', 
-                        help='画像をWebPに一括変換し、テキストやJSONを自動更新する')
+                        help='画像をマルチプロセスでWebPに一括変換し、テキストやJSONを自動更新する')
     grp_webp.add_argument('--target-format', choices=['all', 'jpg', 'png'], default='all',
                         help='(convert-webp用) 変換対象の拡張子 (デフォルト: all)')
     grp_webp.add_argument('--referenced-only', action='store_true',
@@ -473,9 +510,11 @@ if __name__ == '__main__':
                         help='(convert-webp用) 元画像を削除せずに残す (拡張子が矛盾している場合の自動訂正も行う)')
     grp_webp.add_argument('--verbose', action='store_true', 
                         help='(convert-webp用) プログレスバーの代わりに、画像1枚ごとの変換サイズログを詳細に出力する')
+    grp_webp.add_argument('--max-workers', type=int, metavar='NUM',
+                        help='(convert-webp用) 並列処理の最大コア数を指定する (未指定時はOSの全論理コアを使用)')
 
     # リサイズ制限グループ
-    grp_resize = parser.add_argument_group('表示サイズ制限')
+    grp_resize = parser.add_argument_group('表示サイズ制限オプション')
     grp_resize.add_argument('--resize-limit', type=int, metavar='WIDTH',
                         help='指定した横幅(px)を超える画像に対し、DokuWiki構文でサイズ制限(?WIDTH)を付与する')
     grp_resize.add_argument('--overwrite-resize', choices=['width-only', 'keep-ratio'],
@@ -493,7 +532,7 @@ if __name__ == '__main__':
     elif args.archive:
         cmd_archive()
     elif args.convert_webp:
-        cmd_convert_webp(args.target_format, args.referenced_only, args.keep_original, args.verbose)
+        cmd_convert_webp(args.target_format, args.referenced_only, args.keep_original, args.verbose, args.max_workers)
     elif args.resize_limit:
         cmd_resize_limit(args.resize_limit, args.overwrite_resize)
     else:

@@ -26,6 +26,7 @@ TZ_OFFSET = int(config.get('Settings', 'timezone_offset', fallback=9))
 TZ = timezone(timedelta(hours=TZ_OFFSET))
 INCLUDE_FQDN = config.getboolean('Settings', 'include_fqdn_in_redirects', fallback=False)
 USE_ORIGINAL = config.getboolean('Settings', 'use_original_image', fallback=True)
+USE_IMAGEBOX = config.getboolean('Settings', 'use_imagebox_plugin', fallback=False)
 
 API_BASE = f"{WP_URL}/wp-json/wp/v2"
 AUTH = (WP_USER, WP_PASS)
@@ -40,13 +41,7 @@ def ensure_dir(path):
 ensure_dir(PAGES_BASE)
 ensure_dir(MEDIA_BASE)
 
-image_map_data = {
-    "images": {},
-    "pages": {}
-}
-
-# オリジナルURLとUUIDを紐付けるための作業用辞書
-# key: original_url, value: group_uuid
+image_map_data = {"images": {}, "pages": {}}
 url_to_uuid_map = {}
 
 # ==========================================
@@ -114,7 +109,6 @@ def process_and_register_image(target_url, media_dir, unix_time, page_id):
     if not dl_orig_name and not dl_target_name:
         return None
 
-    # 2. UUIDグループの特定または作成 (オリジナルURLのパスを基準にする)
     original_path = parsed_original.path
     if original_path in url_to_uuid_map:
         group_uuid = url_to_uuid_map[original_path]
@@ -123,7 +117,6 @@ def process_and_register_image(target_url, media_dir, unix_time, page_id):
         url_to_uuid_map[original_path] = group_uuid
         image_map_data["images"][group_uuid] = {}
 
-    # 3. 画像情報の登録 (Images)
     if dl_orig_name and dl_orig_path:
         orig_md5 = get_file_md5(dl_orig_path)
         if orig_md5 and orig_md5 not in image_map_data["images"][group_uuid]:
@@ -143,7 +136,6 @@ def process_and_register_image(target_url, media_dir, unix_time, page_id):
                 "is_original": is_orig
             }
 
-    # 4. ページ参照情報の登録 (Pages)
     if page_id not in image_map_data["pages"]:
         image_map_data["pages"][page_id] = {}
 
@@ -170,7 +162,9 @@ def process_and_register_image(target_url, media_dir, unix_time, page_id):
 
     return written_filename
 
-
+# ==========================================
+# DokuWiki構文変換処理
+# ==========================================
 def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time, page_id):
     html_content = html.unescape(html_content)
     html_content = re.sub(r'<!-- wp:.*?-->', '', html_content, flags=re.DOTALL)
@@ -178,28 +172,73 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time,
     
     soup = BeautifulSoup(html_content, 'html.parser')
 
+    # 【手順1】WordPressギャラリーの親ラッパーを解体し、各画像をフラットにする
+    for gallery_figure in soup.find_all('figure', class_=lambda c: c and 'wp-block-gallery' in c):
+        gallery_figure.unwrap()
+        
+    for gallery_ul in soup.find_all('ul', class_=lambda c: c and ('gallery' in c)):
+        for li in gallery_ul.find_all('li', recursive=False):
+            li.unwrap()
+        gallery_ul.unwrap()
+
+    # 【手順2】個別の figure タグを処理 (キャプション付き画像)
+    for figure in soup.find_all('figure'):
+        img = figure.find('img')
+        if not img:
+            continue
+
+        img_url = img.get('src')
+        if not img_url:
+            continue
+
+        # キャプションの取得と二重出力防止のための削除
+        caption_text = ""
+        figcaption = figure.find('figcaption')
+        if figcaption:
+            caption_text = figcaption.get_text(strip=True)
+            figcaption.decompose()
+
+        target_url = img_url
+        parent_a = img.find_parent('a')
+        if parent_a:
+            href = parent_a.get('href', '')
+            if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE):
+                target_url = href
+
+        write_filename = process_and_register_image(target_url, media_dir, unix_time, page_id)
+        if write_filename:
+            doku_img = f"{{{{:blog:{namespace_path}:{write_filename}|{caption_text}}}}}"
+            
+            if caption_text and USE_IMAGEBOX:
+                doku_img = f"[{doku_img}]"
+            
+            # 【変更点】 置換時に末尾に改行 (\n) を追加し、画像同士が横に繋がらないようにする
+            figure.replace_with(doku_img + "\n")
+
+    # 【手順3】figureで囲まれていない単独の img タグの処理
     for img in soup.find_all('img'):
         img_url = img.get('src')
         if not img_url: continue
 
         target_url = img_url
-        parent = img.parent
-        if parent and parent.name == 'a':
-            href = parent.get('href', '')
+        parent_a = img.parent
+        if parent_a and parent_a.name == 'a':
+            href = parent_a.get('href', '')
             if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE):
                 target_url = href
-                parent.unwrap()
+                parent_a.unwrap()
 
         write_filename = process_and_register_image(target_url, media_dir, unix_time, page_id)
         if write_filename:
-            img.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
+            img.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}}}")
 
+    # その他のaタグの処理
     for a in soup.find_all('a'):
         href = a.get('href', '')
         if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE) and 'wp-content/uploads' in href:
             write_filename = process_and_register_image(href, media_dir, unix_time, page_id)
             if write_filename:
-                a.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
+                a.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}}}")
                 continue
                 
         text = a.get_text(strip=True)
@@ -245,6 +284,7 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time,
         h.insert_after(f' {eq}\n\n')
         h.unwrap()
 
+    # ギャラリー以外の純粋な箇条書きの処理
     for ul in soup.find_all('ul'):
         for li in ul.find_all('li', recursive=False):
             li.insert_before('  * ')

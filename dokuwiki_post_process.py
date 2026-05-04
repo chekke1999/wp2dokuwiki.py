@@ -332,7 +332,7 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
 
             if not res["success"]:
                 if verbose:
-                    print(f"[エラー] 変換失敗 ({filename}): {res['error_msg']}")
+                    print(f"[{completed_count}/{total_files}] [エラー] 変換失敗 ({filename}): {res['error_msg']}")
                 else:
                     # プログレスバー表示中に出力すると崩れるため、強制改行して表示
                     print(f"\n[エラー] 変換失敗 ({filename}): {res['error_msg']}")
@@ -374,9 +374,9 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
             total_original_size += res["orig_size"]
             total_converted_size += res["new_size"]
 
-            # 【変更点】 リアルタイムでのログ出力
+            # 【変更点】 リアルタイムでのログ出力に [現在/全体] を付与
             if verbose:
-                print(f"[成功] {filename} ({format_size(res['orig_size'])}) -> {new_filename} ({format_size(res['new_size'])})")
+                print(f"[{completed_count}/{total_files}] [成功] {filename} ({format_size(res['orig_size'])}) -> {new_filename} ({format_size(res['new_size'])})")
             else:
                 print_progress_bar(completed_count, total_files, prefix='Progress:', suffix='Complete', length=50)
 

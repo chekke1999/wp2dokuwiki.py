@@ -18,24 +18,16 @@ PAGES_BASE = os.path.join(DATA_DIR, 'pages', 'blog')
 MEDIA_BASE = os.path.join(DATA_DIR, 'media', 'blog')
 IMAGE_MAP_PATH = os.path.join(script_dir, 'image_map.json')
 
-# ==========================================
-# 共通ユーティリティ関数
-# ==========================================
 def get_all_txt_files():
-    """pages配下のすべての.txtファイルのパスを取得"""
     return glob.glob(os.path.join(PAGES_BASE, '**', '*.txt'), recursive=True)
 
 def get_all_media_files():
-    """media配下のすべてのファイルのパスを取得"""
     return glob.glob(os.path.join(MEDIA_BASE, '**', '*.*'), recursive=True)
 
 def update_text_file(filepath, callback):
-    """テキストファイルを読み込み、コールバック関数で変更があれば保存する"""
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
-    
     new_content = callback(content)
-    
     if new_content != content:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(new_content)
@@ -66,13 +58,18 @@ def cmd_switch(target_type):
     txt_files = get_all_txt_files()
 
     def replace_func(content):
-        for processed_name, original_name in mapping.items():
+        for original_name, processed_list in mapping.items():
+            if not processed_list:
+                continue
+            
+            processed_name = processed_list[0] # 最初の加工済みファイルを採用
+            
             if target_type == 'original':
                 old, new = processed_name, original_name
             else:
                 old, new = original_name, processed_name
             
-            # {{:blog:ns:old_name|}} 等を安全に置換する正規表現
+            # {{:blog:ns:old_name|}} 等を安全に置換
             pattern = r'(\{\{:blog:[^:]+?:)' + re.escape(old) + r'([?|}])'
             content = re.sub(pattern, r'\g<1>' + new + r'\g<2>', content)
         return content
@@ -88,11 +85,9 @@ def cmd_clean():
     txt_files = get_all_txt_files()
     referenced_images = set()
 
-    # 全テキストファイルから参照されている画像ファイル名を抽出
     for filepath in txt_files:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-            # {{:blog:namespace:filename.ext?700|alt}} から filename.ext を抽出
             matches = re.findall(r'\{\{:blog:[^:]+?:([^?|}]+)', content)
             referenced_images.update(matches)
 
@@ -125,12 +120,15 @@ def cmd_clean():
             if filename in mapping:
                 del mapping[filename]
                 map_changed = True
-            # 値(オリジナル)側として登録されている場合の削除
-            keys_to_delete = [k for k, v in mapping.items() if v == filename]
-            for k in keys_to_delete:
-                del mapping[k]
-                map_changed = True
+                
+            for k, v_list in mapping.items():
+                if filename in v_list:
+                    v_list.remove(filename)
+                    map_changed = True
 
+        # 空のリストになったキーを掃除
+        mapping = {k: v for k, v in mapping.items() if v}
+        
         if map_changed:
             save_image_map(mapping)
             
@@ -145,9 +143,6 @@ def cmd_convert_webp(keep_original):
     txt_files = get_all_txt_files()
     
     converted_count = 0
-    map_changed = False
-
-    # テキスト置換用の一括辞書 (古いファイル名 -> 新しいファイル名)
     rename_dict = {}
 
     for filepath in media_files:
@@ -157,7 +152,6 @@ def cmd_convert_webp(keep_original):
             new_filename = base_name + '.webp'
             new_filepath = os.path.splitext(filepath)[0] + '.webp'
             
-            # 既に同名のWebPがある場合はスキップ
             if os.path.exists(new_filepath):
                 continue
 
@@ -172,7 +166,6 @@ def cmd_convert_webp(keep_original):
                 rename_dict[filename] = new_filename
                 converted_count += 1
                 
-                # 元画像を削除する場合
                 if not keep_original:
                     os.remove(filepath)
 
@@ -183,7 +176,7 @@ def cmd_convert_webp(keep_original):
         print("変換可能な画像がありませんでした。")
         return
 
-    # 1. テキストファイルの参照を .webp に書き換え
+    # テキストファイルの書き換え
     txt_updated_count = 0
     def replace_ext_func(content):
         for old_name, new_name in rename_dict.items():
@@ -195,17 +188,14 @@ def cmd_convert_webp(keep_original):
         if update_text_file(filepath, replace_ext_func):
             txt_updated_count += 1
 
-    # 2. image_map.json のキーと値を .webp に書き換え
+    # image_map.json の書き換え
     new_mapping = {}
-    for k, v in mapping.items():
+    for k, v_list in mapping.items():
         new_k = rename_dict.get(k, k)
-        new_v = rename_dict.get(v, v)
-        new_mapping[new_k] = new_v
-        if new_k != k or new_v != v:
-            map_changed = True
+        new_v_list = [rename_dict.get(item, item) for item in v_list]
+        new_mapping[new_k] = new_v_list
 
-    if map_changed:
-        save_image_map(new_mapping)
+    save_image_map(new_mapping)
 
     print(f"WebP変換完了: {converted_count} 枚。")
     print(f"関連する {txt_updated_count} 件のテキストファイルと image_map.json を更新しました。")
@@ -215,14 +205,13 @@ def cmd_resize_limit(limit_width):
     media_files = get_all_media_files()
     large_images = set()
 
-    # 指定サイズ以上の画像をリストアップ
     for filepath in media_files:
         try:
             with Image.open(filepath) as img:
                 if img.width > limit_width:
                     large_images.add(os.path.basename(filepath))
         except IOError:
-            continue # 画像以外のファイルは無視
+            continue
 
     if not large_images:
         print(f"横幅 {limit_width}px を超える画像は見つかりませんでした。")
@@ -233,8 +222,6 @@ def cmd_resize_limit(limit_width):
 
     def apply_resize_func(content):
         for img_name in large_images:
-            # 既にサイズ指定（?数字）がない場合のみ、?LIMIT を付与する
-            # 検索対象: {{:blog:ns:filename|alt}} または {{:blog:ns:filename}}
             pattern = r'(\{\{:blog:[^:]+?:' + re.escape(img_name) + r')([|}])'
             replacement = r'\g<1>?' + str(limit_width) + r'\g<2>'
             content = re.sub(pattern, replacement, content)

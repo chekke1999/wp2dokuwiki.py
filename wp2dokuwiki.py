@@ -2,6 +2,8 @@ import os
 import re
 import html
 import json
+import uuid
+import hashlib
 import configparser
 import requests
 from urllib.parse import urlparse, unquote
@@ -38,54 +40,37 @@ def ensure_dir(path):
 ensure_dir(PAGES_BASE)
 ensure_dir(MEDIA_BASE)
 
-# グローバルな画像マッピング用辞書 (オリジナル名 -> [加工済み名1, 加工済み名2, ...])
-image_map_dict = {}
+image_map_data = {
+    "images": {},
+    "pages": {}
+}
+
+# オリジナルURLとUUIDを紐付けるための作業用辞書
+# key: original_url, value: group_uuid
+url_to_uuid_map = {}
 
 # ==========================================
-# 2. WordPress APIからデータを取得する関数
+# 2. ユーティリティ関数
 # ==========================================
-def get_categories():
-    print("カテゴリ情報を取得中...")
-    categories = {}
-    url = f"{API_BASE}/categories?per_page=100"
-    while url:
-        res = requests.get(url, auth=AUTH)
-        res.raise_for_status()
-        for cat in res.json():
-            raw_name = html.unescape(cat['name'])
-            categories[cat['id']] = sanitize_filename(raw_name)
-        url = res.links.get('next', {}).get('url')
-    return categories
+def get_file_md5(filepath):
+    hash_md5 = hashlib.md5()
+    try:
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except:
+        return None
 
-def get_posts():
-    print("投稿データを取得中...")
-    posts = []
-    url = f"{API_BASE}/posts?status=publish,draft,private&per_page=50"
-    while url:
-        res = requests.get(url, auth=AUTH)
-        if res.status_code != 200:
-            print(f"投稿の取得に失敗しました: {res.status_code}")
-            break
-        data = res.json()
-        posts.extend(data)
-        url = res.links.get('next', {}).get('url')
-        print(f"  ... {len(posts)} 件取得済み")
-    return posts
-
-# ==========================================
-# 3. テキスト・HTML・ファイル操作関数
-# ==========================================
 def sanitize_filename(title):
     decoded = unquote(title)
     decoded = decoded.lower()
     clean = re.sub(r'[\\/*?:"<>|#]+', '', decoded)
-    # クォーテーションやアポストロフィを完全網羅してアンダーバーに置換
     clean = re.sub(r'[ \s\(\)（）『』「」【】。、，,！!？?\'\'""’‘“”]', '_', clean)
     clean = re.sub(r'_+', '_', clean)
     return clean.strip('_')
 
 def get_original_image_url(url):
-    # -scaled, -150x150, -e1602... などの接尾辞が「連続」しているものを全て削除
     return re.sub(r'((?:-\d+x\d+|-scaled|-e\d+)+)(\.[a-zA-Z]+)$', r'\2', url)
 
 def download_image(img_url, save_dir, unix_time):
@@ -95,7 +80,7 @@ def download_image(img_url, save_dir, unix_time):
         save_path = os.path.join(save_dir, filename)
         
         if os.path.exists(save_path):
-            return filename
+            return filename, save_path
 
         res = requests.get(img_url, stream=True)
         if res.status_code == 200:
@@ -103,51 +88,90 @@ def download_image(img_url, save_dir, unix_time):
                 for chunk in res.iter_content(1024):
                     f.write(chunk)
             os.utime(save_path, (unix_time, unix_time))
-            return filename
+            return filename, save_path
         else:
-            return None
+            return None, None
     except Exception as e:
         print(f"画像アクセスエラー ({img_url}): {e}")
-        return None
+        return None, None
 
-def process_and_download_image(target_url, media_dir, unix_time):
-    """
-    オリジナルと加工済みの両方を取得し、JSONマップを記録。
-    Configに従ってテキストに記述するファイル名を返す。
-    """
+def process_and_register_image(target_url, media_dir, unix_time, page_id):
     original_url = get_original_image_url(target_url)
     
     parsed_target = urlparse(target_url)
     parsed_original = urlparse(original_url)
     target_filename = unquote(os.path.basename(parsed_target.path)).lower()
-    original_filename = unquote(os.path.basename(parsed_original.path)).lower()
 
-    downloaded_original = None
-    
-    # ターゲットとオリジナルが異なる（＝加工されている）場合
+    dl_orig_name, dl_orig_path = None, None
+    dl_target_name, dl_target_path = None, None
+
     if target_url != original_url:
-        downloaded_original = download_image(original_url, media_dir, unix_time)
-        downloaded_target = download_image(target_url, media_dir, unix_time)
-        
-        # 辞書の初期化と追加（オリジナルをキーに、加工済みをリストで保持）
-        if downloaded_original and downloaded_target:
-            if original_filename not in image_map_dict:
-                image_map_dict[original_filename] = []
-            if target_filename not in image_map_dict[original_filename]:
-                image_map_dict[original_filename].append(target_filename)
-
-    # ターゲット自体がオリジナル、またはオリジナル取得に失敗した場合
-    if not downloaded_original:
-        downloaded_target = download_image(target_url, media_dir, unix_time)
-        # この場合はオリジナルが存在しないので、辞書には登録せずターゲットをそのまま返す
-        return downloaded_target
-
-    if USE_ORIGINAL:
-        return downloaded_original
+        dl_orig_name, dl_orig_path = download_image(original_url, media_dir, unix_time)
+        dl_target_name, dl_target_path = download_image(target_url, media_dir, unix_time)
     else:
-        return target_filename
+        dl_target_name, dl_target_path = download_image(target_url, media_dir, unix_time)
 
-def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time):
+    if not dl_orig_name and not dl_target_name:
+        return None
+
+    # 2. UUIDグループの特定または作成 (オリジナルURLのパスを基準にする)
+    original_path = parsed_original.path
+    if original_path in url_to_uuid_map:
+        group_uuid = url_to_uuid_map[original_path]
+    else:
+        group_uuid = str(uuid.uuid4())
+        url_to_uuid_map[original_path] = group_uuid
+        image_map_data["images"][group_uuid] = {}
+
+    # 3. 画像情報の登録 (Images)
+    if dl_orig_name and dl_orig_path:
+        orig_md5 = get_file_md5(dl_orig_path)
+        if orig_md5 and orig_md5 not in image_map_data["images"][group_uuid]:
+            image_map_data["images"][group_uuid][orig_md5] = {
+                "filename": dl_orig_name,
+                "filesize": os.path.getsize(dl_orig_path),
+                "is_original": True
+            }
+
+    if dl_target_name and dl_target_path:
+        target_md5 = get_file_md5(dl_target_path)
+        if target_md5 and target_md5 not in image_map_data["images"][group_uuid]:
+            is_orig = True if not dl_orig_name else False
+            image_map_data["images"][group_uuid][target_md5] = {
+                "filename": dl_target_name,
+                "filesize": os.path.getsize(dl_target_path),
+                "is_original": is_orig
+            }
+
+    # 4. ページ参照情報の登録 (Pages)
+    if page_id not in image_map_data["pages"]:
+        image_map_data["pages"][page_id] = {}
+
+    written_filename = None
+    if dl_orig_name and USE_ORIGINAL:
+        written_filename = dl_orig_name
+    elif dl_target_name:
+        written_filename = dl_target_name
+    elif dl_orig_name:
+        written_filename = dl_orig_name
+
+    if group_uuid not in image_map_data["pages"][page_id]:
+        image_map_data["pages"][page_id][group_uuid] = {
+            "current": written_filename,
+            "history": {}
+        }
+    
+    if dl_orig_name:
+        image_map_data["pages"][page_id][group_uuid]["history"]["original"] = dl_orig_name
+    if dl_target_name and dl_target_name != dl_orig_name:
+        image_map_data["pages"][page_id][group_uuid]["history"]["processed"] = dl_target_name
+
+    image_map_data["pages"][page_id][group_uuid]["current"] = written_filename
+
+    return written_filename
+
+
+def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time, page_id):
     html_content = html.unescape(html_content)
     html_content = re.sub(r'<!-- wp:.*?-->', '', html_content, flags=re.DOTALL)
     html_content = re.sub(r'<!-- /wp:.*?-->', '', html_content, flags=re.DOTALL)
@@ -159,8 +183,6 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time)
         if not img_url: continue
 
         target_url = img_url
-        
-        # aタグで囲まれている場合、aタグのリンク先を優先 (直リンク対策)
         parent = img.parent
         if parent and parent.name == 'a':
             href = parent.get('href', '')
@@ -168,14 +190,14 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time)
                 target_url = href
                 parent.unwrap()
 
-        write_filename = process_and_download_image(target_url, media_dir, unix_time)
+        write_filename = process_and_register_image(target_url, media_dir, unix_time, page_id)
         if write_filename:
             img.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
 
     for a in soup.find_all('a'):
         href = a.get('href', '')
         if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE) and 'wp-content/uploads' in href:
-            write_filename = process_and_download_image(href, media_dir, unix_time)
+            write_filename = process_and_register_image(href, media_dir, unix_time, page_id)
             if write_filename:
                 a.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
                 continue
@@ -242,6 +264,37 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time)
     return text.strip()
 
 # ==========================================
+# 3. WordPress API取得
+# ==========================================
+def get_categories():
+    print("カテゴリ情報を取得中...")
+    categories = {}
+    url = f"{API_BASE}/categories?per_page=100"
+    while url:
+        res = requests.get(url, auth=AUTH)
+        res.raise_for_status()
+        for cat in res.json():
+            raw_name = html.unescape(cat['name'])
+            categories[cat['id']] = sanitize_filename(raw_name)
+        url = res.links.get('next', {}).get('url')
+    return categories
+
+def get_posts():
+    print("投稿データを取得中...")
+    posts = []
+    url = f"{API_BASE}/posts?status=publish,draft,private&per_page=50"
+    while url:
+        res = requests.get(url, auth=AUTH)
+        if res.status_code != 200:
+            print(f"投稿の取得に失敗しました: {res.status_code}")
+            break
+        data = res.json()
+        posts.extend(data)
+        url = res.links.get('next', {}).get('url')
+        print(f"  ... {len(posts)} 件取得済み")
+    return posts
+
+# ==========================================
 # 4. メイン処理
 # ==========================================
 def main():
@@ -276,13 +329,15 @@ def main():
             else:
                 namespace = "uncategorized"
 
+        page_id = f"blog:{namespace}:{title_clean}"
+
         post_page_dir = os.path.join(PAGES_BASE, namespace)
         post_media_dir = os.path.join(MEDIA_BASE, namespace)
         ensure_dir(post_page_dir)
         ensure_dir(post_media_dir)
 
         html_content = post['content']['rendered']
-        dokuwiki_content = convert_html_to_dokuwiki(html_content, post_media_dir, namespace, unix_time)
+        dokuwiki_content = convert_html_to_dokuwiki(html_content, post_media_dir, namespace, unix_time, page_id)
 
         txt_path = os.path.join(post_page_dir, f"{title_clean}.txt")
         final_content = f"~~META: date created = {date_str} ~~\n\n====== {title_raw} ======\n\n{dokuwiki_content}"
@@ -291,12 +346,12 @@ def main():
             f.write(final_content)
             
         os.utime(txt_path, (unix_time, unix_time))
-        print(f"出力完了: [blog:{namespace}:{title_clean}] ({status})")
+        print(f"出力完了: [{page_id}] ({status})")
 
         wp_link = post.get('link', '')
         if not INCLUDE_FQDN:
             wp_link = urlparse(wp_link).path
-        redirect_list.append(f"301 {wp_link} blog:{namespace}:{title_clean}")
+        redirect_list.append(f"301 {wp_link} {page_id}")
 
     redirects_path = os.path.join(script_dir, 'redirects.txt')
     with open(redirects_path, 'w', encoding='utf-8') as f:
@@ -305,7 +360,7 @@ def main():
 
     image_map_path = os.path.join(script_dir, 'image_map.json')
     with open(image_map_path, 'w', encoding='utf-8') as f:
-        json.dump(image_map_dict, f, ensure_ascii=False, indent=4)
+        json.dump(image_map_data, f, ensure_ascii=False, indent=4)
     print(f"画像マッピングリストを作成しました: {image_map_path}")
 
 if __name__ == '__main__':

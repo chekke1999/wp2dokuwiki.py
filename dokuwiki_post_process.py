@@ -73,13 +73,27 @@ def save_image_map(data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 def update_text_file(filepath, callback):
+    """
+    ファイルを読み込み、callback関数で内容を処理して保存する。
+    ★変更点: 保存時にファイルのタイムスタンプ（更新日時・アクセス日時）を維持する。
+    """
+    # 元のタイムスタンプを取得
+    stat_info = os.stat(filepath)
+    atime = stat_info.st_atime
+    mtime = stat_info.st_mtime
+
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
+        
     new_content = callback(content)
+    
     if new_content != content:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(new_content)
+        # 書き込み後、元のタイムスタンプを復元
+        os.utime(filepath, (atime, mtime))
         return True
+        
     return False
 
 def get_referenced_images():
@@ -374,7 +388,7 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
             total_original_size += res["orig_size"]
             total_converted_size += res["new_size"]
 
-            # 【変更点】 リアルタイムでのログ出力に [現在/全体] を付与
+            # リアルタイムでのログ出力
             if verbose:
                 print(f"[{completed_count}/{total_files}] [成功] {filename} ({format_size(res['orig_size'])}) -> {new_filename} ({format_size(res['new_size'])})")
             else:
@@ -439,13 +453,27 @@ def cmd_convert_webp(target_format, referenced_only, keep_original, verbose, max
 
 def cmd_resize_limit(limit_width, overwrite_mode):
     media_files = get_all_media_files()
+    
+    # ★変更点: 画像のパス（ネームスペース）とファイル名をセットで管理し、他記事の同名ファイルへの誤爆を防ぐ
+    # キー: DokuWikiの参照構文に一致する "ネームスペース:ファイル名"
+    # 値: (width, height)
     large_images = {} 
 
     for filepath in media_files:
         try:
             with Image.open(filepath) as img:
                 if img.width > limit_width:
-                    large_images[os.path.basename(filepath)] = (img.width, img.height)
+                    # パスから blog:xxx:filename の形を構築する
+                    rel_path = os.path.relpath(filepath, MEDIA_BASE)
+                    ns_path = os.path.dirname(rel_path).replace(os.sep, ':')
+                    filename = os.path.basename(rel_path)
+                    
+                    if ns_path:
+                        doku_ref_key = f"{ns_path}:{filename}"
+                    else:
+                        doku_ref_key = filename
+                        
+                    large_images[doku_ref_key] = (img.width, img.height)
         except IOError:
             continue
 
@@ -457,9 +485,13 @@ def cmd_resize_limit(limit_width, overwrite_mode):
     txt_files = get_all_txt_files()
 
     def apply_resize_func(content):
-        for img_name, (w, h) in large_images.items():
+        # 厳密なネームスペース付きのキーで置換を行う
+        for ref_key, (w, h) in large_images.items():
+            
+            # 上書きモード時の処理
             if overwrite_mode:
-                pattern = r'(\{\{:blog:[^:]+?:' + re.escape(img_name) + r')(\?\d+(?:x\d+)?)([|}])'
+                # パターン: {{:blog: + ネームスペース:ファイル名 + ?既存サイズ + |か}
+                pattern = r'(\{\{:blog:' + re.escape(ref_key) + r')(\?\d+(?:x\d+)?)([|}])'
                 def replacement_func(match):
                     base, existing_query, tail = match.groups()
                     if overwrite_mode == 'width-only':
@@ -474,7 +506,8 @@ def cmd_resize_limit(limit_width, overwrite_mode):
                     return match.group(0)
                 content = re.sub(pattern, replacement_func, content)
 
-            pattern_no_size = r'(\{\{:blog:[^:]+?:' + re.escape(img_name) + r')([|}])'
+            # サイズ指定がないものへの追加処理
+            pattern_no_size = r'(\{\{:blog:' + re.escape(ref_key) + r')([|}])'
             replacement_no_size = r'\g<1>?' + str(limit_width) + r'\g<2>'
             content = re.sub(pattern_no_size, replacement_no_size, content)
             

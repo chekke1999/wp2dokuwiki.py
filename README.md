@@ -48,12 +48,44 @@ archive_namespace = archive
 use_imagebox_plugin = True
 ```
 
-**[設定項目の解説]**
-- `app_password`: WordPressの「アプリケーションパスワード」を発行して設定してください。
-- `data_dir`: DokuWikiのデータディレクトリ（`pages` や `media` フォルダが入っている場所）のパスを指定します。
-- `use_original_image`: `True` の場合、WordPressでリサイズされた画像URL（例: `img-300x200.jpg`）ではなく、元のオリジナル画像（`img.jpg`）を優先してDokuWikiの参照として設定します。
-- `archive_namespace`: `--archive` コマンド実行時に、未参照画像を退避させるメディアネームスペース名です。
-- `use_imagebox_plugin`: `True` にすると、キャプション付き画像を `[ ]` で囲む `Plugin imagebox` 用の構文を出力します。
+#### `[WordPress]` セクション
+移行元となるWordPressへのAPIアクセスに関する設定です。
+*   **`url`**
+    *   **説明:** 移行元のWordPressサイトのトップURLを指定します。末尾のスラッシュ（`/`）はあってもなくても自動で補正されます。
+    *   **例:** `[https://your-wordpress-site.com](https://your-wordpress-site.com)`
+*   **`username`**
+    *   **説明:** WordPressの管理者（または記事の読み取り権限を持つ）ユーザー名を指定します。
+    *   **例:** `admin_user`
+*   **`app_password`**
+    *   **説明:** WordPressの「アプリケーションパスワード」を指定します。通常のログインパスワードとは異なり、WordPressの管理画面（ユーザー ＞ プロフィール）からAPIアクセス専用に発行するパスワードです。空白区切りでもそのまま記述可能です。
+    *   **例:** `xxxx xxxx xxxx xxxx xxxx xxxx`
+
+#### `[DokuWiki]` セクション
+移行先となるDokuWikiの出力先に関する設定です。
+*   **`data_dir`**
+    *   **説明:** DokuWikiのデータディレクトリ（`pages` や `media` フォルダが格納されているディレクトリ）へのパスを指定します。相対パス（`./`）または絶対パスで記述します。
+    *   **例:** `./dokuwiki/data` （スクリプトと同じ階層にある `dokuwiki` フォルダ内に出力する場合）
+
+#### `[Settings]` セクション
+スクリプトの動作や、DokuWiki構文への変換ルールに関する詳細設定です。
+*   **`timezone_offset`**
+    *   **説明:** WordPressから取得した記事の作成日時（UTC）を現地時間に変換するための時差（時間）を指定します。日本時間（JST）の場合は `9` を指定します。
+    *   **例:** `9`
+*   **`include_fqdn_in_redirects`**
+    *   **説明:** スクリプト完了時に出力されるリダイレクト用リスト（`redirects.txt`）の「転送元URL」に、ドメイン名を含めるかどうかを指定します。
+        *   `True`: ドメイン名を含む完全なURL（例: `[https://example.com/2020/post/](https://example.com/2020/post/)`）で出力されます。
+        *   `False`: ドメイン名を省いたパスのみ（例: `/2020/post/`）で出力されます。`.htaccess` 等でリダイレクトを書く場合は `False` が便利です。
+*   **`use_original_image`**
+    *   **説明:** 画像を取得・配置する際、WordPressが自動生成したリサイズ版の画像（ファイル名に `-scaled` や `-300x200` 等が付くもの）ではなく、元のオリジナル画像を優先して使用するかどうかを指定します。
+        *   `True`: オリジナル画像を優先してDokuWiki構文を生成します（画質を重視する場合推奨）。
+        *   `False`: HTMLに記述されていたリサイズ画像のURLをそのまま使用します。
+*   **`archive_namespace`**
+    *   **説明:** 後処理スクリプト（`dokuwiki_post_process.py`）で `--archive` コマンドを実行した際、どの記事からも参照されていない「未使用画像」を退避（移動）させるためのメディアネームスペース名（フォルダ名）を指定します。
+    *   **例:** `archive` （この場合、`media/blog/archive/` フォルダに移動されます）
+*   **`use_imagebox_plugin`**
+    *   **説明:** DokuWikiの「Plugin imagebox」を利用している環境向けの設定です。
+        *   `True`: WordPress側でキャプションが設定されていた画像に対して、`[ {{:namespace:image.jpg|キャプション}} ]` のように `[ ]` で囲んだ専用構文を出力します。
+        *   `False`: キャプションの有無に関わらず、通常のDokuWiki画像構文 `{{:namespace:image.jpg|キャプション}}` を出力します。
 
 ---
 

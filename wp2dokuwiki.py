@@ -230,7 +230,7 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time,
 
         write_filename = process_and_register_image(target_url, media_dir, unix_time, page_id)
         if write_filename:
-            img.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
+            img.replace_with(f"\n{{{{:blog:{namespace_path}:{write_filename}|}}}}\\\\")
 
     # その他のaタグの処理
     for a in soup.find_all('a'):
@@ -238,7 +238,7 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time,
         if re.search(r'\.(jpe?g|png|gif|webp)(\?.*)?$', href, re.IGNORECASE) and 'wp-content/uploads' in href:
             write_filename = process_and_register_image(href, media_dir, unix_time, page_id)
             if write_filename:
-                a.replace_with(f"{{{{:blog:{namespace_path}:{write_filename}|}}}}")
+                a.replace_with(f"\n{{{{:blog:{namespace_path}:{write_filename}|}}}}\\\\")
                 continue
                 
         text = a.get_text(strip=True)

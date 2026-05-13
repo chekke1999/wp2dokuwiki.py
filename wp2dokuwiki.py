@@ -69,33 +69,53 @@ def get_original_image_url(url):
     return re.sub(r'((?:-\d+x\d+|-scaled|-e\d+)+)(\.[a-zA-Z]+)$', r'\2', url)
 
 def download_image(img_url, save_dir, unix_time):
+    """
+    【変更点】画像をダウンロードし、同名ファイルがある場合はハッシュ値を比較する。
+    ハッシュが異なれば連番を付与して保存し、ハッシュが同じなら既存ファイルを流用する。
+    """
     try:
         parsed_url = urlparse(img_url)
-        filename = unquote(os.path.basename(parsed_url.path)).lower()
-        save_path = os.path.join(save_dir, filename)
+        base_filename = unquote(os.path.basename(parsed_url.path)).lower()
+        name, ext = os.path.splitext(base_filename)
         
-        if os.path.exists(save_path):
-            return filename, save_path
-
+        # データをメモリにダウンロード
         res = requests.get(img_url, stream=True)
-        if res.status_code == 200:
-            with open(save_path, 'wb') as f:
-                for chunk in res.iter_content(1024):
-                    f.write(chunk)
-            os.utime(save_path, (unix_time, unix_time))
-            return filename, save_path
-        else:
+        if res.status_code != 200:
             return None, None
+            
+        content = res.content
+        downloaded_md5 = hashlib.md5(content).hexdigest()
+        
+        filename = base_filename
+        save_path = os.path.join(save_dir, filename)
+        counter = 1
+        
+        # 同名ファイルが存在する場合の処理
+        while os.path.exists(save_path):
+            existing_md5 = get_file_md5(save_path)
+            if existing_md5 == downloaded_md5:
+                # 中身が完全に同じ画像なので、ダウンロードせず既存のものを再利用
+                return filename, save_path
+            else:
+                # 中身が違う別画像なので、ファイル名に連番を付与
+                filename = f"{name}_{counter}{ext}"
+                save_path = os.path.join(save_dir, filename)
+                counter += 1
+                
+        # 新しいファイル（または連番付きファイル）として保存
+        with open(save_path, 'wb') as f:
+            f.write(content)
+        os.utime(save_path, (unix_time, unix_time))
+        
+        return filename, save_path
+
     except Exception as e:
         print(f"画像アクセスエラー ({img_url}): {e}")
         return None, None
 
 def process_and_register_image(target_url, media_dir, unix_time, page_id):
     original_url = get_original_image_url(target_url)
-    
-    parsed_target = urlparse(target_url)
     parsed_original = urlparse(original_url)
-    target_filename = unquote(os.path.basename(parsed_target.path)).lower()
 
     dl_orig_name, dl_orig_path = None, None
     dl_target_name, dl_target_path = None, None
@@ -167,10 +187,33 @@ def process_and_register_image(target_url, media_dir, unix_time, page_id):
 # ==========================================
 def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time, page_id):
     html_content = html.unescape(html_content)
-    html_content = re.sub(r'<!-- wp:.*?-->', '', html_content, flags=re.DOTALL)
-    html_content = re.sub(r'<!-- /wp:.*?-->', '', html_content, flags=re.DOTALL)
+    html_content = re.sub(r'', '', html_content, flags=re.DOTALL)
+    html_content = re.sub(r'', '', html_content, flags=re.DOTALL)
     
     soup = BeautifulSoup(html_content, 'html.parser')
+
+    # 【追加機能1】 コードスニペットの変換処理 (ブロックコード)
+    for pre in soup.find_all('pre'):
+        # プラグインのデータ属性から言語(Bash, Javascriptなど)を取得
+        lang = pre.get('data-shcb-language-slug', '')
+        
+        # 末尾についているプラグインのゴミタグ (Code language: XXX) を抽出前に削除する
+        small_tag = pre.find('small', class_=lambda c: c and 'shcb-language' in c)
+        if small_tag:
+            small_tag.decompose()
+            
+        # 生のコードテキストを抽出（HTMLエスケープ文字は get_text() が自動でデコードしてくれます）
+        code_text = pre.get_text().strip('\r\n')
+        
+        lang_attr = f" {lang}" if lang else ""
+        doku_code = f"\n<code{lang_attr}>\n{code_text}\n</code>\n"
+        pre.replace_with(doku_code)
+
+    # 【追加機能2】 インラインコード（文中の <code>）の処理
+    # ※上のブロックコード処理で <pre> と一緒に置換されたものはここには含まれません（安全です）
+    for code in soup.find_all('code'):
+        inline_text = code.get_text()
+        code.replace_with(f"''{inline_text}''")
 
     # 【手順1】WordPressギャラリーの親ラッパーを解体し、各画像をフラットにする
     for gallery_figure in soup.find_all('figure', class_=lambda c: c and 'wp-block-gallery' in c):
@@ -191,7 +234,6 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time,
         if not img_url:
             continue
 
-        # キャプションの取得と二重出力防止のための削除
         caption_text = ""
         figcaption = figure.find('figcaption')
         if figcaption:
@@ -212,7 +254,7 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time,
             if caption_text and USE_IMAGEBOX:
                 doku_img = f"[{doku_img}]"
             
-            # 【変更点】 置換時に末尾に改行 (\n) を追加し、画像同士が横に繋がらないようにする
+            # 画像同士が繋がらないよう末尾に改行を追加
             figure.replace_with(doku_img + "\n")
 
     # 【手順3】figureで囲まれていない単独の img タグの処理
@@ -230,6 +272,7 @@ def convert_html_to_dokuwiki(html_content, media_dir, namespace_path, unix_time,
 
         write_filename = process_and_register_image(target_url, media_dir, unix_time, page_id)
         if write_filename:
+            # ご自身で修正いただいた回り込み防止の改行アプローチ
             img.replace_with(f"\n{{{{:blog:{namespace_path}:{write_filename}|}}}}\\\\")
 
     # その他のaタグの処理
